@@ -1,0 +1,540 @@
+---
+title: "ceRNA Network in Endometrial Cancer — Step 3: Correlation & Sensitivity Analysis"
+author: "Alessia Toska"
+date: "`r Sys.Date()`"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## 1. Libraries
+
+```{r libraries}
+library(tidyverse)
+library(ppcor)
+library(parallel)
+library(patchwork)
+```
+
+## 2. Load Step 2 Data
+
+```{r load-data}
+results_dir <- here::here("results")
+load(file.path(results_dir, "de_results.RData"))
+
+# mclapply forks processes, which Windows does not support: run serially there
+n_cores <- if (.Platform$OS.type == "windows") 1 else max(1, parallel::detectCores() - 1)
+
+cat("=== Tumor ===\n")
+cat("DE mRNAs:", nrow(de_mrna_expr_tumor), "x", ncol(de_mrna_expr_tumor), "samples\n")
+cat("DE lncRNAs:", nrow(de_lncrna_expr_tumor), "x", ncol(de_lncrna_expr_tumor), "samples\n")
+cat("DE miRNAs:", nrow(de_mirna_expr_tumor), "x", ncol(de_mirna_expr_tumor), "samples\n")
+
+cat("\n=== Normal ===\n")
+cat("DE mRNAs:", nrow(de_mrna_expr_normal), "x", ncol(de_mrna_expr_normal), "samples\n")
+cat("DE lncRNAs:", nrow(de_lncrna_expr_normal), "x", ncol(de_lncrna_expr_normal), "samples\n")
+cat("DE miRNAs:", nrow(de_mirna_expr_normal), "x", ncol(de_mirna_expr_normal), "samples\n")
+```
+
+## 3. Identify Candidate ceRNA Pairs
+
+Compute Pearson correlation between every DE lncRNA and every DE mRNA.
+
+### 3a. Tumor: lncRNA-mRNA Correlation
+
+```{r cor-tumor, cache=TRUE}
+mrna_t   <- t(de_mrna_expr_tumor)
+lncrna_t <- t(de_lncrna_expr_tumor)
+
+cor_matrix_tumor <- cor(lncrna_t, mrna_t, method = "pearson", use = "pairwise.complete.obs")
+all_cors_tumor <- as.vector(cor_matrix_tumor)
+all_cors_tumor <- all_cors_tumor[!is.na(all_cors_tumor)]
+
+threshold_tumor <- round(quantile(all_cors_tumor, 0.99), 2)
+
+cat("Tumor correlation distribution:\n")
+cat("  Min:", round(min(all_cors_tumor), 3), "\n")
+cat("  Median:", round(median(all_cors_tumor), 3), "\n")
+cat("  Max:", round(max(all_cors_tumor), 3), "\n")
+cat("  99th percentile threshold:", threshold_tumor, "\n")
+```
+
+```{r candidate-pairs-tumor}
+candidate_idx_tumor <- which(cor_matrix_tumor > threshold_tumor, arr.ind = TRUE)
+
+candidate_pairs_tumor <- data.frame(
+  lncRNA = rownames(cor_matrix_tumor)[candidate_idx_tumor[, 1]],
+  mRNA   = colnames(cor_matrix_tumor)[candidate_idx_tumor[, 2]],
+  r      = cor_matrix_tumor[candidate_idx_tumor],
+  stringsAsFactors = FALSE
+) %>%
+  arrange(desc(r))
+
+cat("Candidate cognate pairs (r >", threshold_tumor, "):",
+    nrow(candidate_pairs_tumor), "\n")
+cat("Unique lncRNAs:", n_distinct(candidate_pairs_tumor$lncRNA), "\n")
+cat("Unique mRNAs:", n_distinct(candidate_pairs_tumor$mRNA), "\n")
+```
+
+### 3b. Normal: lncRNA-mRNA Correlation
+
+```{r cor-normal, cache=TRUE}
+mrna_n   <- t(de_mrna_expr_normal)
+lncrna_n <- t(de_lncrna_expr_normal)
+
+cor_matrix_normal <- cor(lncrna_n, mrna_n, method = "pearson", use = "pairwise.complete.obs")
+all_cors_normal <- as.vector(cor_matrix_normal)
+all_cors_normal <- all_cors_normal[!is.na(all_cors_normal)]
+
+threshold_normal <- round(quantile(all_cors_normal, 0.99), 2)
+
+cat("Normal correlation distribution:\n")
+cat("  Min:", round(min(all_cors_normal), 3), "\n")
+cat("  Median:", round(median(all_cors_normal), 3), "\n")
+cat("  Max:", round(max(all_cors_normal), 3), "\n")
+cat("  99th percentile threshold:", threshold_normal, "\n")
+```
+
+```{r candidate-pairs-normal}
+candidate_idx_normal <- which(cor_matrix_normal > threshold_normal, arr.ind = TRUE)
+
+if (nrow(candidate_idx_normal) > 0) {
+  candidate_pairs_normal <- data.frame(
+    lncRNA = rownames(cor_matrix_normal)[candidate_idx_normal[, 1]],
+    mRNA   = colnames(cor_matrix_normal)[candidate_idx_normal[, 2]],
+    r      = cor_matrix_normal[candidate_idx_normal],
+    stringsAsFactors = FALSE
+  ) %>%
+    arrange(desc(r))
+
+  cat("Candidate cognate pairs (r >", threshold_normal, "):",
+      nrow(candidate_pairs_normal), "\n")
+  cat("Unique lncRNAs:", n_distinct(candidate_pairs_normal$lncRNA), "\n")
+  cat("Unique mRNAs:", n_distinct(candidate_pairs_normal$mRNA), "\n")
+} else {
+  candidate_pairs_normal <- data.frame()
+  cat("No candidate pairs in normal at 99th percentile threshold.\n")
+}
+```
+
+### 3c. Correlation Distribution Plots
+
+```{r cor-distributions, fig.width=12, fig.height=5}
+p_tumor <- ggplot(data.frame(r = all_cors_tumor), aes(x = r)) +
+  geom_density(fill = "#E41A1C", alpha = 0.3) +
+  geom_vline(xintercept = threshold_tumor, linetype = "dashed", color = "red") +
+  annotate("text", x = threshold_tumor + 0.03, y = 0.5,
+           label = paste0("99th = ", threshold_tumor), hjust = 0, size = 3.5) +
+  labs(title = "Tumor: lncRNA-mRNA Correlation Distribution",
+       x = "Pearson r", y = "Density") +
+  theme_classic(base_size = 12)
+
+p_normal <- ggplot(data.frame(r = all_cors_normal), aes(x = r)) +
+  geom_density(fill = "#377EB8", alpha = 0.3) +
+  geom_vline(xintercept = threshold_normal, linetype = "dashed", color = "blue") +
+  annotate("text", x = threshold_normal + 0.03, y = 0.5,
+           label = paste0("99th = ", threshold_normal), hjust = 0, size = 3.5) +
+  labs(title = "Normal: lncRNA-mRNA Correlation Distribution",
+       x = "Pearson r", y = "Density") +
+  theme_classic(base_size = 12)
+
+p_tumor + p_normal + plot_annotation(tag_levels = "A")
+```
+
+## 4. Pre-flight Diagnostics
+
+```{r preflight-diagnostics}
+mirna_t <- t(de_mirna_expr_tumor)
+
+common_samples <- Reduce(intersect, list(
+  rownames(mrna_t), rownames(lncrna_t), rownames(mirna_t)
+))
+
+cat("=== Tumor ===\n")
+cat("Common samples:", length(common_samples), "\n")
+
+mrna_t_   <- mrna_t[common_samples, ]
+lncrna_t_ <- lncrna_t[common_samples, ]
+mirna_t_  <- mirna_t[common_samples, ]
+
+cat("Candidate pairs:", nrow(candidate_pairs_tumor), "\n")
+cat("DE miRNAs:", ncol(mirna_t_), "\n")
+cat("Total triplets:", format(nrow(candidate_pairs_tumor) * ncol(mirna_t_), big.mark = ","), "\n")
+print(summary(candidate_pairs_tumor$r))
+
+mirna_n <- t(de_mirna_expr_normal)
+
+common_samples_n <- Reduce(intersect, list(
+  rownames(mrna_n), rownames(lncrna_n), rownames(mirna_n)
+))
+
+cat("\n=== Normal ===\n")
+cat("Common samples:", length(common_samples_n), "\n")
+
+mrna_n_   <- mrna_n[common_samples_n, ]
+lncrna_n_ <- lncrna_n[common_samples_n, ]
+mirna_n_  <- mirna_n[common_samples_n, ]
+
+cat("Candidate pairs:", nrow(candidate_pairs_normal), "\n")
+cat("DE miRNAs:", ncol(mirna_n_), "\n")
+if (nrow(candidate_pairs_normal) > 0) {
+  cat("Total triplets:", format(nrow(candidate_pairs_normal) * ncol(mirna_n_), big.mark = ","), "\n")
+  print(summary(candidate_pairs_normal$r))
+}
+```
+
+## 5. Full Sensitivity Correlation — Tumor
+
+```{r full-sensitivity-tumor, cache=TRUE}
+library(parallel)
+
+cat("Running tumor sensitivity correlation (", n_cores, " cores)...\n", sep = "")
+full_start <- Sys.time()
+
+sens_results_tumor <- mclapply(seq_len(nrow(candidate_pairs_tumor)), function(i) {
+  lnc <- candidate_pairs_tumor$lncRNA[i]
+  mrn <- candidate_pairs_tumor$mRNA[i]
+  rho_xy <- candidate_pairs_tumor$r[i]
+  
+  x <- mrna_t_[, mrn]
+  y <- lncrna_t_[, lnc]
+  
+  mirna_names <- colnames(mirna_t_)
+  n_mirna <- length(mirna_names)
+  
+  S_vals       <- numeric(n_mirna)
+  r_mirna_mrna <- numeric(n_mirna)
+  r_mirna_lnc  <- numeric(n_mirna)
+  
+  for (k in seq_len(n_mirna)) {
+    z <- mirna_t_[, k]
+    rho_xz <- cor(x, z, use = "pairwise.complete.obs")
+    rho_yz <- cor(y, z, use = "pairwise.complete.obs")
+    denom <- sqrt((1 - rho_xz^2) * (1 - rho_yz^2))
+    if (denom < 1e-10) {
+      S_vals[k] <- NA
+      r_mirna_mrna[k] <- rho_xz
+      r_mirna_lnc[k]  <- rho_yz
+    } else {
+      rho_xy_z <- (rho_xy - rho_xz * rho_yz) / denom
+      S_vals[k] <- rho_xy - rho_xy_z
+      r_mirna_mrna[k] <- rho_xz
+      r_mirna_lnc[k]  <- rho_yz
+    }
+  }
+  
+  data.frame(
+    lncRNA       = lnc,
+    mRNA         = mrn,
+    miRNA        = mirna_names,
+    r_lnc_mrna   = rho_xy,
+    S            = S_vals,
+    r_mirna_mrna = r_mirna_mrna,
+    r_mirna_lnc  = r_mirna_lnc,
+    stringsAsFactors = FALSE
+  )
+}, mc.cores = n_cores)
+
+sens_df_tumor <- bind_rows(sens_results_tumor)
+full_elapsed <- as.numeric(difftime(Sys.time(), full_start, units = "secs"))
+
+cat("Done in", round(full_elapsed, 1), "sec\n")
+cat("Total triplets:", format(nrow(sens_df_tumor), big.mark = ","), "\n")
+cat("NAs:", sum(is.na(sens_df_tumor$S)), "\n")
+```
+
+## 6. Full Sensitivity Correlation — Normal
+
+```{r full-sensitivity-normal, cache=TRUE, eval=(nrow(candidate_pairs_normal) > 0)}
+cat("Running normal sensitivity correlation (", n_cores, " cores)...\n", sep = "")
+full_start_n <- Sys.time()
+
+sens_results_normal <- mclapply(seq_len(nrow(candidate_pairs_normal)), function(i) {
+  lnc <- candidate_pairs_normal$lncRNA[i]
+  mrn <- candidate_pairs_normal$mRNA[i]
+  rho_xy <- candidate_pairs_normal$r[i]
+  
+  x <- mrna_n_[, mrn]
+  y <- lncrna_n_[, lnc]
+  
+  mirna_names <- colnames(mirna_n_)
+  n_mirna <- length(mirna_names)
+  
+  S_vals       <- numeric(n_mirna)
+  r_mirna_mrna <- numeric(n_mirna)
+  r_mirna_lnc  <- numeric(n_mirna)
+  
+  for (k in seq_len(n_mirna)) {
+    z <- mirna_n_[, k]
+    rho_xz <- cor(x, z, use = "pairwise.complete.obs")
+    rho_yz <- cor(y, z, use = "pairwise.complete.obs")
+    denom <- sqrt((1 - rho_xz^2) * (1 - rho_yz^2))
+    if (denom < 1e-10) {
+      S_vals[k] <- NA
+      r_mirna_mrna[k] <- rho_xz
+      r_mirna_lnc[k]  <- rho_yz
+    } else {
+      rho_xy_z <- (rho_xy - rho_xz * rho_yz) / denom
+      S_vals[k] <- rho_xy - rho_xy_z
+      r_mirna_mrna[k] <- rho_xz
+      r_mirna_lnc[k]  <- rho_yz
+    }
+  }
+  
+  data.frame(
+    lncRNA       = lnc,
+    mRNA         = mrn,
+    miRNA        = mirna_names,
+    r_lnc_mrna   = rho_xy,
+    S            = S_vals,
+    r_mirna_mrna = r_mirna_mrna,
+    r_mirna_lnc  = r_mirna_lnc,
+    stringsAsFactors = FALSE
+  )
+}, mc.cores = n_cores)
+
+sens_df_normal <- bind_rows(sens_results_normal)
+full_elapsed_n <- as.numeric(difftime(Sys.time(), full_start_n, units = "secs"))
+
+cat("Done in", round(full_elapsed_n, 1), "sec\n")
+cat("Total triplets:", format(nrow(sens_df_normal), big.mark = ","), "\n")
+cat("NAs:", sum(is.na(sens_df_normal$S)), "\n")
+```
+
+## 7. S Distribution & Threshold Selection
+
+```{r s-distributions, fig.width=12, fig.height=5}
+# Tumor
+S_clean <- sens_df_tumor$S[!is.na(sens_df_tumor$S)]
+p99 <- round(quantile(S_clean, 0.99), 1)
+
+cat("=== Tumor S distribution ===\n")
+cat("Min:", round(min(S_clean), 2), "\n")
+cat("Median:", round(median(S_clean), 2), "\n")
+cat("Mean:", round(mean(S_clean), 2), "\n")
+cat("99th pctl:", p99, "\n")
+cat("Max:", round(max(S_clean), 2), "\n")
+
+p_s_tumor <- ggplot(data.frame(S = S_clean), aes(x = S)) +
+  geom_histogram(bins = 150, fill = "steelblue", color = NA, alpha = 0.7) +
+  geom_vline(xintercept = p99, linetype = "dashed", color = "red") +
+  annotate("text", x = p99 + 0.005, y = Inf, vjust = 2,
+           label = paste0("99th = ", p99), color = "red", size = 3.5) +
+  labs(title = "Tumor: Sensitivity Correlation Distribution",
+       x = "S", y = "Count") +
+  theme_classic(base_size = 12)
+
+# Normal
+if (exists("sens_df_normal") && nrow(sens_df_normal) > 0) {
+  S_clean_n <- sens_df_normal$S[!is.na(sens_df_normal$S)]
+  p99_n <- round(quantile(S_clean_n, 0.99), 1)
+  
+  cat("\n=== Normal S distribution ===\n")
+  cat("Min:", round(min(S_clean_n), 2), "\n")
+  cat("Median:", round(median(S_clean_n), 2), "\n")
+  cat("Mean:", round(mean(S_clean_n), 2), "\n")
+  cat("99th pctl:", p99_n, "\n")
+  cat("Max:", round(max(S_clean_n), 2), "\n")
+  
+  p_s_normal <- ggplot(data.frame(S = S_clean_n), aes(x = S)) +
+    geom_histogram(bins = 150, fill = "#377EB8", color = NA, alpha = 0.7) +
+    geom_vline(xintercept = p99_n, linetype = "dashed", color = "red") +
+    annotate("text", x = p99_n + 0.01, y = Inf, vjust = 2,
+             label = paste0("99th = ", p99_n), color = "red", size = 3.5) +
+    labs(title = "Normal: Sensitivity Correlation Distribution",
+         x = "S", y = "Count") +
+    theme_classic(base_size = 12)
+  
+  p_s_tumor + p_s_normal + plot_annotation(tag_levels = "A")
+} else {
+  p_s_tumor
+}
+```
+
+## 8. Filter ceRNA Triplets
+
+```{r filter-tumor}
+S_threshold <- p99
+cat("=== TUMOR ===\n")
+cat("S threshold:", S_threshold, "(99th percentile)\n\n")
+
+cerna_triplets_tumor <- sens_df_tumor %>%
+  filter(!is.na(S), S > S_threshold, r_mirna_mrna < 0, r_mirna_lnc < 0) %>%
+  arrange(desc(S))
+
+cat("Passing S threshold only:", sum(sens_df_tumor$S > S_threshold, na.rm = TRUE), "\n")
+cat("Passing S + negative cors:", nrow(cerna_triplets_tumor), "\n")
+cat("Unique lncRNAs:", n_distinct(cerna_triplets_tumor$lncRNA), "\n")
+cat("Unique mRNAs:", n_distinct(cerna_triplets_tumor$mRNA), "\n")
+cat("Unique miRNAs:", n_distinct(cerna_triplets_tumor$miRNA), "\n")
+cat("\n=== Top 20 triplets ===\n")
+print(head(cerna_triplets_tumor, 20))
+```
+
+```{r filter-normal, eval=(exists("sens_df_normal") && nrow(sens_df_normal) > 0)}
+S_threshold_n <- p99_n
+cat("=== NORMAL ===\n")
+cat("S threshold:", S_threshold_n, "(99th percentile)\n\n")
+
+cerna_triplets_normal <- sens_df_normal %>%
+  filter(!is.na(S), S > S_threshold_n, r_mirna_mrna < 0, r_mirna_lnc < 0) %>%
+  arrange(desc(S))
+
+cat("Passing S threshold only:", sum(sens_df_normal$S > S_threshold_n, na.rm = TRUE), "\n")
+cat("Passing S + negative cors:", nrow(cerna_triplets_normal), "\n")
+cat("Unique lncRNAs:", n_distinct(cerna_triplets_normal$lncRNA), "\n")
+cat("Unique mRNAs:", n_distinct(cerna_triplets_normal$mRNA), "\n")
+cat("Unique miRNAs:", n_distinct(cerna_triplets_normal$miRNA), "\n")
+
+if (nrow(cerna_triplets_normal) > 0) {
+  cat("\n=== Top 20 triplets ===\n")
+  print(head(cerna_triplets_normal, 20))
+}
+```
+
+## 9. Hub Analysis
+
+```{r tumor-hubs}
+lnc_hubs <- cerna_triplets_tumor %>%
+  group_by(lncRNA) %>%
+  summarise(
+    n_mRNAs = n_distinct(mRNA), n_miRNAs = n_distinct(miRNA),
+    n_edges = n(), mean_S = mean(S), .groups = "drop"
+  ) %>% arrange(desc(n_edges))
+
+mirna_hubs <- cerna_triplets_tumor %>%
+  group_by(miRNA) %>%
+  summarise(
+    n_lncRNAs = n_distinct(lncRNA), n_mRNAs = n_distinct(mRNA),
+    n_edges = n(), .groups = "drop"
+  ) %>% arrange(desc(n_edges))
+
+cat("=== Tumor hub lncRNAs ===\n")
+print(lnc_hubs)
+cat("\n=== Tumor hub miRNAs ===\n")
+print(mirna_hubs)
+```
+
+```{r normal-hubs, eval=(exists("cerna_triplets_normal") && nrow(cerna_triplets_normal) > 0)}
+lnc_hubs_n <- cerna_triplets_normal %>%
+  group_by(lncRNA) %>%
+  summarise(
+    n_mRNAs = n_distinct(mRNA), n_miRNAs = n_distinct(miRNA),
+    n_edges = n(), mean_S = mean(S), .groups = "drop"
+  ) %>% arrange(desc(n_edges))
+
+mirna_hubs_n <- cerna_triplets_normal %>%
+  group_by(miRNA) %>%
+  summarise(
+    n_lncRNAs = n_distinct(lncRNA), n_mRNAs = n_distinct(mRNA),
+    n_edges = n(), .groups = "drop"
+  ) %>% arrange(desc(n_edges))
+
+cat("=== Normal hub lncRNAs ===\n")
+print(lnc_hubs_n)
+cat("\n=== Normal hub miRNAs ===\n")
+print(mirna_hubs_n)
+```
+
+## 10. Tumor vs Normal Comparison
+
+```{r compare-networks}
+cat("=== Network Comparison ===\n")
+cat("\nTumor network:\n")
+cat("  Correlation threshold (99th pctl):", threshold_tumor, "\n")
+cat("  S threshold (99th pctl):", S_threshold, "\n")
+cat("  Triplets:", nrow(cerna_triplets_tumor), "\n")
+cat("  lncRNAs:", n_distinct(cerna_triplets_tumor$lncRNA), "\n")
+cat("  mRNAs:", n_distinct(cerna_triplets_tumor$mRNA), "\n")
+cat("  miRNAs:", n_distinct(cerna_triplets_tumor$miRNA), "\n")
+
+if (!exists("cerna_triplets_normal")) {
+  cerna_triplets_normal <- data.frame()
+}
+
+cat("\nNormal network:\n")
+cat("  Correlation threshold (99th pctl):", threshold_normal, "\n")
+if (nrow(cerna_triplets_normal) > 0) {
+  cat("  S threshold (99th pctl):", S_threshold_n, "\n")
+  cat("  Triplets:", nrow(cerna_triplets_normal), "\n")
+  cat("  lncRNAs:", n_distinct(cerna_triplets_normal$lncRNA), "\n")
+  cat("  mRNAs:", n_distinct(cerna_triplets_normal$mRNA), "\n")
+  cat("  miRNAs:", n_distinct(cerna_triplets_normal$miRNA), "\n")
+  
+  shared_lnc  <- intersect(cerna_triplets_tumor$lncRNA, cerna_triplets_normal$lncRNA)
+  shared_mrna <- intersect(cerna_triplets_tumor$mRNA, cerna_triplets_normal$mRNA)
+  shared_mirna <- intersect(cerna_triplets_tumor$miRNA, cerna_triplets_normal$miRNA)
+  
+  cat("\nShared lncRNAs:", length(shared_lnc), "\n")
+  if (length(shared_lnc) > 0) cat("  ", paste(shared_lnc, collapse = ", "), "\n")
+  cat("Shared mRNAs:", length(shared_mrna), "\n")
+  if (length(shared_mrna) > 0) cat("  ", paste(shared_mrna, collapse = ", "), "\n")
+  cat("Shared miRNAs:", length(shared_mirna), "\n")
+  if (length(shared_mirna) > 0) cat("  ", paste(shared_mirna, collapse = ", "), "\n")
+} else {
+  cat("  No triplets — normal ceRNA network is empty.\n")
+}
+```
+
+## 11. Save Everything
+
+```{r save-all}
+save(sens_df_tumor, cerna_triplets_tumor, S_threshold, lnc_hubs, mirna_hubs,
+     threshold_tumor, threshold_normal,
+     sens_df_normal, cerna_triplets_normal, S_threshold_n, lnc_hubs_n, mirna_hubs_n,
+     file = file.path(results_dir, "sensitivity_results.RData"))
+
+# Tumor edges
+cyto_edges <- bind_rows(
+  cerna_triplets_tumor %>%
+    distinct(lncRNA, miRNA) %>%
+    transmute(source = lncRNA, target = miRNA, interaction = "sponge"),
+  cerna_triplets_tumor %>%
+    distinct(miRNA, mRNA) %>%
+    transmute(source = miRNA, target = mRNA, interaction = "repression")
+)
+write_csv(cyto_edges, file.path(results_dir, "cerna_network_edges.csv"))
+cat("Saved", nrow(cyto_edges), "tumor edges for Cytoscape\n")
+
+# Tumor node types
+node_types <- bind_rows(
+  cerna_triplets_tumor %>% distinct(node = lncRNA) %>% mutate(type = "lncRNA"),
+  cerna_triplets_tumor %>% distinct(node = miRNA) %>% mutate(type = "miRNA"),
+  cerna_triplets_tumor %>% distinct(node = mRNA) %>% mutate(type = "mRNA")
+)
+write_csv(node_types, file.path(results_dir, "cerna_network_nodes.csv"))
+cat("Saved", nrow(node_types), "tumor node types\n")
+
+# Normal edges + nodes
+if (nrow(cerna_triplets_normal) > 0) {
+  cyto_edges_n <- bind_rows(
+    cerna_triplets_normal %>%
+      distinct(lncRNA, miRNA) %>%
+      transmute(source = lncRNA, target = miRNA, interaction = "sponge"),
+    cerna_triplets_normal %>%
+      distinct(miRNA, mRNA) %>%
+      transmute(source = miRNA, target = mRNA, interaction = "repression")
+  )
+  write_csv(cyto_edges_n, file.path(results_dir, "cerna_network_edges_normal.csv"))
+  cat("Saved", nrow(cyto_edges_n), "normal edges for Cytoscape\n")
+  
+  node_types_n <- bind_rows(
+    cerna_triplets_normal %>% distinct(node = lncRNA) %>% mutate(type = "lncRNA"),
+    cerna_triplets_normal %>% distinct(node = miRNA) %>% mutate(type = "miRNA"),
+    cerna_triplets_normal %>% distinct(node = mRNA) %>% mutate(type = "mRNA")
+  )
+  write_csv(node_types_n, file.path(results_dir, "cerna_network_nodes_normal.csv"))
+  cat("Saved", nrow(node_types_n), "normal node types\n")
+}
+
+cat("\nAll results saved.\n")
+```
+
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,514 @@
+---
+title: "ceRNA Network in Endometrial Cancer — Step 2: Differential Expression Analysis"
+author: "Alessia Toska"
+date: "`r Sys.Date()`"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## 1. Create Figure Directories
+
+```{r directories}
+base <- here::here("figures")
+subdirs <- c(
+  "PCA",
+  "Volcano",
+  "DE_summary",
+  "Heatmap"
+)
+invisible(lapply(file.path(base, subdirs), function(d) {
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+}))
+```
+
+## 2. Load Libraries
+
+```{r libraries}
+library(tidyverse)
+library(DESeq2)
+library(PCAtools)
+library(EnhancedVolcano)
+library(pheatmap)
+library(patchwork)
+library(UpSetR)
+library(RColorBrewer)
+```
+
+## 3. Load Step 1 Data
+
+```{r load-data}
+results_dir <- here::here("results")
+load(file.path(results_dir, "processed_data.RData"))
+
+cat("mRNA filtered:", nrow(mrna_filtered), "genes x", ncol(mrna_filtered), "samples\n")
+cat("lncRNA filtered:", nrow(lncrna_filtered), "genes x", ncol(lncrna_filtered), "samples\n")
+cat("miRNA filtered:", nrow(mirna_filtered), "miRNAs x", ncol(mirna_filtered), "samples\n")
+cat("\nTissue breakdown:\n")
+print(table(tissue_vec))
+```
+
+## 4. Convert Rownames to Gene Symbols
+
+```{r convert-symbols}
+gene_info$gene_id_stripped <- sub("\\.\\d+$", "", gene_info$gene_id)
+
+# --- mRNA: ENSEMBL -> gene symbol ---
+mrna_ids_stripped <- sub("\\.\\d+$", "", rownames(mrna_filtered))
+mrna_symbols <- gene_info$gene_name[match(mrna_ids_stripped, gene_info$gene_id_stripped)]
+keep <- !is.na(mrna_symbols)
+mrna_filtered <- mrna_filtered[keep, ]
+mrna_symbols  <- mrna_symbols[keep]
+dups <- duplicated(mrna_symbols) | duplicated(mrna_symbols, fromLast = TRUE)
+if (any(dups)) {
+  row_means <- rowMeans(mrna_filtered)
+  mrna_filtered <- mrna_filtered %>%
+    mutate(.symbol = mrna_symbols, .mean = row_means) %>%
+    group_by(.symbol) %>%
+    slice_max(order_by = .mean, n = 1) %>%
+    ungroup()
+  mrna_symbols <- mrna_filtered$.symbol
+  mrna_filtered <- mrna_filtered %>% select(-.symbol, -.mean)
+}
+rownames(mrna_filtered) <- mrna_symbols
+
+# --- lncRNA: ENSEMBL -> gene symbol ---
+lncrna_ids_stripped <- sub("\\.\\d+$", "", rownames(lncrna_filtered))
+lncrna_symbols <- gene_info$gene_name[match(lncrna_ids_stripped, gene_info$gene_id_stripped)]
+keep <- !is.na(lncrna_symbols)
+lncrna_filtered <- lncrna_filtered[keep, ]
+lncrna_symbols  <- lncrna_symbols[keep]
+dups <- duplicated(lncrna_symbols) | duplicated(lncrna_symbols, fromLast = TRUE)
+if (any(dups)) {
+  row_means <- rowMeans(lncrna_filtered)
+  lncrna_filtered <- lncrna_filtered %>%
+    mutate(.symbol = lncrna_symbols, .mean = row_means) %>%
+    group_by(.symbol) %>%
+    slice_max(order_by = .mean, n = 1) %>%
+    ungroup()
+  lncrna_symbols <- lncrna_filtered$.symbol
+  lncrna_filtered <- lncrna_filtered %>% select(-.symbol, -.mean)
+}
+rownames(lncrna_filtered) <- lncrna_symbols
+
+cat("mRNA after symbol conversion:", nrow(mrna_filtered), "genes\n")
+cat("lncRNA after symbol conversion:", nrow(lncrna_filtered), "genes\n")
+```
+
+## 5. Verify and Prepare Data for DESeq2
+
+```{r verify-prepare}
+stopifnot(identical(names(tissue_vec), colnames(mrna_filtered)))
+stopifnot(identical(names(tissue_vec), colnames(lncrna_filtered)))
+stopifnot(identical(names(tissue_vec), colnames(mirna_filtered)))
+
+condition <- factor(tissue_vec, levels = c("Normal", "Tumor"))
+
+cat("Condition levels:", levels(condition), "\n")
+cat("Normal:", sum(condition == "Normal"), "\n")
+cat("Tumor:", sum(condition == "Tumor"), "\n")
+```
+
+## 6. DESeq2 — mRNA
+
+```{r deseq2-mrna, cache=TRUE}
+col_data <- data.frame(condition = condition, row.names = colnames(mrna_filtered))
+
+dds_mrna <- DESeqDataSetFromMatrix(
+  countData = mrna_filtered,
+  colData   = col_data,
+  design    = ~ condition
+)
+dds_mrna <- DESeq(dds_mrna)
+res_mrna <- results(dds_mrna, contrast = c("condition", "Tumor", "Normal"))
+
+cat("mRNA DESeq2 complete.\n")
+summary(res_mrna)
+```
+
+## DESeq2 — lncRNA
+
+```{r deseq2-lncrna, cache=TRUE}
+dds_lncrna <- DESeqDataSetFromMatrix(
+  countData = lncrna_filtered,
+  colData   = col_data,
+  design    = ~ condition
+)
+dds_lncrna <- DESeq(dds_lncrna)
+res_lncrna <- results(dds_lncrna, contrast = c("condition", "Tumor", "Normal"))
+
+cat("lncRNA DESeq2 complete.\n")
+summary(res_lncrna)
+```
+
+## DESeq2 — miRNA
+
+```{r deseq2-mirna, cache=TRUE}
+dds_mirna <- DESeqDataSetFromMatrix(
+  countData = mirna_filtered,
+  colData   = col_data,
+  design    = ~ condition
+)
+dds_mirna <- DESeq(dds_mirna)
+res_mirna <- results(dds_mirna, contrast = c("condition", "Tumor", "Normal"))
+
+cat("miRNA DESeq2 complete.\n")
+summary(res_mirna)
+```
+
+## 7. Apply DE Thresholds
+
+|log2FC| > 1 and FDR < 0.05, as specified in the proposal.
+
+```{r apply-thresholds}
+de_mrna <- as.data.frame(res_mrna) %>%
+  rownames_to_column("symbol") %>%
+  filter(!is.na(padj), !is.na(log2FoldChange)) %>%
+  filter(abs(log2FoldChange) > 1, padj < 0.05) %>%
+  arrange(padj)
+
+de_lncrna <- as.data.frame(res_lncrna) %>%
+  rownames_to_column("symbol") %>%
+  filter(!is.na(padj), !is.na(log2FoldChange)) %>%
+  filter(abs(log2FoldChange) > 1, padj < 0.05) %>%
+  arrange(padj)
+
+de_mirna <- as.data.frame(res_mirna) %>%
+  rownames_to_column("miRNA_ID") %>%
+  filter(!is.na(padj), !is.na(log2FoldChange)) %>%
+  filter(abs(log2FoldChange) > 1, padj < 0.05) %>%
+  arrange(padj)
+
+cat("DE mRNAs (|log2FC| > 1, FDR < 0.05):", nrow(de_mrna), "\n")
+cat("  Upregulated:", sum(de_mrna$log2FoldChange > 0), "\n")
+cat("  Downregulated:", sum(de_mrna$log2FoldChange < 0), "\n")
+
+cat("\nDE lncRNAs (|log2FC| > 1, FDR < 0.05):", nrow(de_lncrna), "\n")
+cat("  Upregulated:", sum(de_lncrna$log2FoldChange > 0), "\n")
+cat("  Downregulated:", sum(de_lncrna$log2FoldChange < 0), "\n")
+
+cat("\nDE miRNAs (|log2FC| > 1, FDR < 0.05):", nrow(de_mirna), "\n")
+cat("  Upregulated:", sum(de_mirna$log2FoldChange > 0), "\n")
+cat("  Downregulated:", sum(de_mirna$log2FoldChange < 0), "\n")
+```
+
+## 8. PCA Plots
+
+```{r pca-vst}
+vsd <- vst(dds_mrna, blind = TRUE)
+
+meta <- data.frame(
+  condition = condition,
+  row.names = colnames(vsd)
+)
+
+p <- pca(assay(vsd), metadata = meta, removeVar = 0.1)
+```
+
+### PCA Biplot
+
+```{r pca-biplot, fig.width=8, fig.height=6}
+biplot_pca <- biplot(p,
+  colby          = "condition",
+  encircle       = TRUE,
+  encircleFill   = TRUE,
+  showLoadings   = FALSE,
+  lab            = NULL,
+  legendPosition = "right",
+  title          = "PCA Biplot: UCEC Tumor vs Normal",
+  pointSize      = 1
+)
+biplot_pca
+
+ggsave(file.path(base, "PCA", "PCA_biplot.pdf"), plot = biplot_pca, width = 8, height = 6)
+```
+
+## 10. Volcano Plots — Combined Panel
+
+```{r volcano-panel, fig.width=24, fig.height=10}
+# --- mRNA volcano ---
+df_mrna <- as.data.frame(res_mrna) %>% filter(!is.na(padj))
+df_mrna$label <- ifelse(rownames(df_mrna) %in% de_mrna$symbol,
+                        rownames(df_mrna), "")
+
+v_mrna <- EnhancedVolcano(df_mrna,
+  lab             = df_mrna$label,
+  title           = "mRNA",
+  subtitle        = "",
+  caption         = "",
+  x               = "log2FoldChange",
+  y               = "padj",
+  ylab            = bquote(~ -Log[10] ~ italic(FDR)),
+  legendLabels    = c("NS", expression(Log[2] ~ FC), "FDR",
+                      expression(FDR ~ and ~ log[2] ~ FC)),
+  FCcutoff        = 1,
+  pCutoff         = 0.05,
+  axisLabSize     = 12,
+  max.overlaps    = 15,
+  drawConnectors  = TRUE,
+  widthConnectors = 0.5,
+  arrowheads      = FALSE,
+  boxedLabels     = TRUE,
+  labSize         = 2.5
+)
+
+# --- lncRNA volcano ---
+df_lncrna <- as.data.frame(res_lncrna) %>% filter(!is.na(padj))
+df_lncrna$label <- ifelse(rownames(df_lncrna) %in% de_lncrna$symbol,
+                          rownames(df_lncrna), "")
+
+v_lncrna <- EnhancedVolcano(df_lncrna,
+  lab             = df_lncrna$label,
+  title           = "lncRNA",
+  subtitle        = "",
+  caption         = "",
+  x               = "log2FoldChange",
+  y               = "padj",
+  ylab            = bquote(~ -Log[10] ~ italic(FDR)),
+  legendLabels    = c("NS", expression(Log[2] ~ FC), "FDR",
+                      expression(FDR ~ and ~ log[2] ~ FC)),
+  FCcutoff        = 1,
+  pCutoff         = 0.05,
+  axisLabSize     = 12,
+  max.overlaps    = 15,
+  drawConnectors  = TRUE,
+  widthConnectors = 0.5,
+  arrowheads      = FALSE,
+  boxedLabels     = TRUE,
+  labSize         = 2.5
+)
+
+# --- miRNA volcano ---
+df_mirna <- as.data.frame(res_mirna) %>% filter(!is.na(padj))
+df_mirna$label <- rownames(df_mirna)
+
+v_mirna <- EnhancedVolcano(df_mirna,
+  lab             = df_mirna$label,
+  title           = "miRNA",
+  subtitle        = "",
+  caption         = "",
+  x               = "log2FoldChange",
+  y               = "padj",
+  ylab            = bquote(~ -Log[10] ~ italic(FDR)),
+  legendLabels    = c("NS", expression(Log[2] ~ FC), "FDR",
+                      expression(FDR ~ and ~ log[2] ~ FC)),
+  FCcutoff        = 1,
+  pCutoff         = 0.05,
+  axisLabSize     = 12,
+  max.overlaps    = 15,
+  drawConnectors  = TRUE,
+  widthConnectors = 0.5,
+  arrowheads      = FALSE,
+  boxedLabels     = TRUE,
+  labSize         = 2.5
+)
+
+# --- Combine into panel with patchwork ---
+volcano_panel <- v_mrna + v_lncrna + v_mirna +
+  plot_layout(ncol = 3, guides = "collect") +
+  plot_annotation(tag_levels = "A") &
+  theme(legend.position = "bottom")
+
+volcano_panel
+ggsave(file.path(base, "Volcano", "Volcano_panel.pdf"),
+       plot = volcano_panel, width = 24, height = 10)
+ggsave(file.path(base, "Volcano", "Volcano_panel.png"),
+       plot = volcano_panel, width = 24, height = 10, dpi = 150)
+```
+
+## 11. Up/Down Regulation Summary
+
+```{r up-down}
+up <- list(
+  mRNA   = de_mrna %>% filter(log2FoldChange > 0) %>% pull(symbol),
+  lncRNA = de_lncrna %>% filter(log2FoldChange > 0) %>% pull(symbol),
+  miRNA  = de_mirna %>% filter(log2FoldChange > 0) %>% pull(miRNA_ID)
+)
+down <- list(
+  mRNA   = de_mrna %>% filter(log2FoldChange < 0) %>% pull(symbol),
+  lncRNA = de_lncrna %>% filter(log2FoldChange < 0) %>% pull(symbol),
+  miRNA  = de_mirna %>% filter(log2FoldChange < 0) %>% pull(miRNA_ID)
+)
+
+cat("Up-regulated: mRNA =", length(up$mRNA), ", lncRNA =", length(up$lncRNA), ", miRNA =", length(up$miRNA), "\n")
+cat("Down-regulated: mRNA =", length(down$mRNA), ", lncRNA =", length(down$lncRNA), ", miRNA =", length(down$miRNA), "\n")
+```
+
+## 12. DE Summary Barplot
+
+```{r de-barplot, fig.width=7, fig.height=5}
+de_summary <- data.frame(
+  RNA_Type  = rep(c("mRNA", "lncRNA", "miRNA"), each = 2),
+  Direction = rep(c("Up", "Down"), 3),
+  Count     = c(
+    length(up$mRNA), length(down$mRNA),
+    length(up$lncRNA), length(down$lncRNA),
+    length(up$miRNA), length(down$miRNA)
+  )
+)
+
+de_bar <- ggplot(de_summary, aes(x = RNA_Type, y = Count, fill = Direction)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = Count), position = position_dodge(width = 0.9),
+            vjust = -0.5, size = 3.5) +
+  scale_fill_manual(values = c("Up" = "#E41A1C", "Down" = "#377EB8")) +
+  labs(
+    title = "Differentially Expressed Genes: Tumor vs Normal",
+    subtitle = "|log2FC| > 1, FDR < 0.05",
+    x = NULL, y = "Number of DE Genes"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+de_bar
+
+ggsave(file.path(base, "DE_summary", "DE_barplot.pdf"), plot = de_bar, width = 7, height = 5)
+ggsave(file.path(base, "DE_summary", "DE_barplot.png"), plot = de_bar, width = 7, height = 5, dpi = 150)
+```
+
+## 13. Heatmap of Top DE mRNAs
+
+```{r heatmap-top-de, fig.width=10, fig.height=8}
+top_mrna_symbols <- head(de_mrna$symbol, 30)
+
+matched_symbols <- top_mrna_symbols[top_mrna_symbols %in% rownames(vsd)]
+cat("Matched genes for heatmap:", length(matched_symbols), "out of", length(top_mrna_symbols), "\n")
+
+mat <- assay(vsd)[matched_symbols, , drop = FALSE]
+
+# Remove any zero-variance rows
+row_vars <- apply(mat, 1, var, na.rm = TRUE)
+mat <- mat[row_vars > 0, , drop = FALSE]
+cat("Genes after variance filter:", nrow(mat), "\n")
+
+ann_col <- data.frame(Tissue = condition, row.names = colnames(mat))
+ann_colors <- list(Tissue = c("Normal" = "#377EB8", "Tumor" = "#E41A1C"))
+
+pheatmap(
+  mat,
+  scale             = "row",
+  color             = colorRampPalette(c("blue", "white", "red"))(50),
+  annotation_col    = ann_col,
+  annotation_colors = ann_colors,
+  show_colnames     = FALSE,
+  fontsize_row      = 7,
+  main              = "Top 30 DE mRNAs: Tumor vs Normal",
+  clustering_distance_cols = "euclidean",
+  clustering_method = "ward.D2"
+)
+
+dev.copy2pdf(file = file.path(base, "Heatmap", "Top30_DE_mRNA_heatmap.pdf"), width = 10, height = 8)
+```
+
+## Heatmap of Top DE lncRNAs
+
+```{r heatmap-lncrna, fig.width=10, fig.height=8}
+vsd_lncrna <- vst(dds_lncrna, blind = FALSE)
+
+top_lncrna_symbols <- head(de_lncrna$symbol, 30)
+matched_lncrna <- top_lncrna_symbols[top_lncrna_symbols %in% rownames(vsd_lncrna)]
+
+mat_lnc <- assay(vsd_lncrna)[matched_lncrna, , drop = FALSE]
+
+row_vars_lnc <- apply(mat_lnc, 1, var, na.rm = TRUE)
+mat_lnc <- mat_lnc[row_vars_lnc > 0, , drop = FALSE]
+
+pheatmap(
+  mat_lnc,
+  scale             = "row",
+  color             = colorRampPalette(c("blue", "white", "red"))(50),
+  annotation_col    = ann_col,
+  annotation_colors = ann_colors,
+  show_colnames     = FALSE,
+  fontsize_row      = 8,
+  main              = "Top 30 DE lncRNAs: Tumor vs Normal",
+  clustering_method = "ward.D2"
+)
+
+dev.copy2pdf(file = file.path(base, "Heatmap", "Top30_DE_lncRNA_heatmap.pdf"), width = 10, height = 8)
+```
+
+## Heatmap of Top DE miRNAs
+
+```{r heatmap-mirna, fig.width=10, fig.height=8}
+vsd_mirna <- varianceStabilizingTransformation(dds_mirna, blind = FALSE)
+
+top_mirna_ids <- head(de_mirna$miRNA_ID, 30)
+matched_mirna <- top_mirna_ids[top_mirna_ids %in% rownames(vsd_mirna)]
+
+mat_mir <- assay(vsd_mirna)[matched_mirna, , drop = FALSE]
+
+row_vars_mir <- apply(mat_mir, 1, var, na.rm = TRUE)
+mat_mir <- mat_mir[row_vars_mir > 0, , drop = FALSE]
+
+pheatmap(
+  mat_mir,
+  scale             = "row",
+  color             = colorRampPalette(c("blue", "white", "red"))(50),
+  annotation_col    = ann_col,
+  annotation_colors = ann_colors,
+  show_colnames     = FALSE,
+  fontsize_row      = 8,
+  main              = "Top 30 DE miRNAs: Tumor vs Normal",
+  clustering_method = "ward.D2"
+)
+
+dev.copy2pdf(file = file.path(base, "Heatmap", "Top30_DE_miRNA_heatmap.pdf"), width = 10, height = 8)
+```
+
+## 14. Extract Normalized Expression for Downstream Correlation
+
+```{r normalized-expression}
+vsd_mirna <- varianceStabilizingTransformation(dds_mirna, blind = FALSE)
+
+tumor_keys  <- names(tissue_vec[tissue_vec == "Tumor"])
+normal_keys <- names(tissue_vec[tissue_vec == "Normal"])
+cat("Tumor samples:", length(tumor_keys), "\n")
+cat("Normal samples:", length(normal_keys), "\n")
+
+# --- Tumor ---
+de_mrna_expr_tumor   <- as.data.frame(assay(vsd)[de_mrna$symbol[de_mrna$symbol %in% rownames(vsd)], tumor_keys])
+de_lncrna_expr_tumor <- as.data.frame(assay(vsd_lncrna)[de_lncrna$symbol[de_lncrna$symbol %in% rownames(vsd_lncrna)], tumor_keys])
+de_mirna_expr_tumor  <- as.data.frame(assay(vsd_mirna)[de_mirna$miRNA_ID[de_mirna$miRNA_ID %in% rownames(vsd_mirna)], tumor_keys])
+
+# --- Normal ---
+de_mrna_expr_normal   <- as.data.frame(assay(vsd)[de_mrna$symbol[de_mrna$symbol %in% rownames(vsd)], normal_keys])
+de_lncrna_expr_normal <- as.data.frame(assay(vsd_lncrna)[de_lncrna$symbol[de_lncrna$symbol %in% rownames(vsd_lncrna)], normal_keys])
+de_mirna_expr_normal  <- as.data.frame(assay(vsd_mirna)[de_mirna$miRNA_ID[de_mirna$miRNA_ID %in% rownames(vsd_mirna)], normal_keys])
+
+cat("\n--- Tumor ---\n")
+cat("mRNA:", nrow(de_mrna_expr_tumor), "x", ncol(de_mrna_expr_tumor), "\n")
+cat("lncRNA:", nrow(de_lncrna_expr_tumor), "x", ncol(de_lncrna_expr_tumor), "\n")
+cat("miRNA:", nrow(de_mirna_expr_tumor), "x", ncol(de_mirna_expr_tumor), "\n")
+
+cat("\n--- Normal ---\n")
+cat("mRNA:", nrow(de_mrna_expr_normal), "x", ncol(de_mrna_expr_normal), "\n")
+cat("lncRNA:", nrow(de_lncrna_expr_normal), "x", ncol(de_lncrna_expr_normal), "\n")
+cat("miRNA:", nrow(de_mirna_expr_normal), "x", ncol(de_mirna_expr_normal), "\n")
+```
+
+```{r}
+save(
+  dds_mrna, dds_lncrna, dds_mirna,
+  res_mrna, res_lncrna, res_mirna,
+  de_mrna, de_lncrna, de_mirna,
+  de_mrna_expr_tumor, de_lncrna_expr_tumor, de_mirna_expr_tumor,
+  de_mrna_expr_normal, de_lncrna_expr_normal, de_mirna_expr_normal,
+  vsd, vsd_lncrna, vsd_mirna,
+  tumor_keys, normal_keys,
+  condition,
+  file = file.path(results_dir, "de_results.RData")
+)
+```
+
+
+
+**Next:** Pearson correlation and sensitivity correlation analysis .
+
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```

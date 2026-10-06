@@ -1,0 +1,370 @@
+---
+title: "ceRNA Network in Endometrial Cancer — Step 1: Data Preparation"
+author: "Alessia Toska"
+date: "`r Sys.Date()`"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## 1. Load Libraries
+
+```{r libraries}
+library(tidyverse)
+library(data.table)
+```
+
+## 2. Define Paths
+
+```{r paths}
+# Paths are relative to the project root (see README for the data layout)
+data_dir          <- here::here("data", "tcga_ucec")              # raw GDC downloads
+sample_sheet_path <- here::here("data", "gdc_sample_sheet.tsv")   # GDC sample sheet
+results_dir       <- here::here("results")                         # intermediate .RData
+dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+## 3. Read and Explore the GDC Sample Sheet
+
+
+```{r read-sample-sheet}
+sample_sheet <- read_tsv(sample_sheet_path, show_col_types = FALSE)
+
+# See all column names
+cat("Column names in sample sheet:\n")
+print(colnames(sample_sheet))
+
+cat("\nDimensions:", nrow(sample_sheet), "rows x", ncol(sample_sheet), "columns\n")
+```
+
+```{r explore-sample-sheet}
+# Preview the full data
+head(sample_sheet)
+
+print(table(sample_sheet$`Data Type`))
+print(table(sample_sheet$`Tissue Type`))
+```
+
+## 4. Identify RNA-Seq and miRNA-Seq Files on Disk
+
+```{r list-files}
+rna_files <- list.files(data_dir,
+                        pattern = "rna_seq\\.augmented_star_gene_counts\\.tsv$",
+                        recursive = TRUE,
+                        full.names = TRUE)
+
+mirna_files <- list.files(data_dir,
+                          pattern = "mirbase21\\.mirnas\\.quantification\\.txt$",
+                          recursive = TRUE,
+                          full.names = TRUE)
+
+cat("RNA-Seq files found on disk:", length(rna_files), "\n")
+cat("miRNA-Seq files found on disk:", length(mirna_files), "\n")
+```
+
+## 5. Inspect One RNA-Seq File
+
+```{r inspect-rna}
+test_rna <- read_tsv(rna_files[1], comment = "#", show_col_types = FALSE)
+cat("Dimensions:", nrow(test_rna), "rows x", ncol(test_rna), "columns\n\n")
+cat("Column names:\n")
+print(colnames(test_rna))
+head(test_rna, 10)
+```
+
+The first 4 rows are summary statistics (`N_unmapped`, `N_multimapping`, `N_noFeature`, `N_ambiguous`) — these need to be removed. The `gene_type` column contains GENCODE biotype annotations (e.g., `protein_coding`, `lncRNA`) that we'll use to separate mRNAs from lncRNAs.
+
+## 6. Inspect One miRNA-Seq File
+
+```{r inspect-mirna}
+test_mirna <- read_tsv(mirna_files[1], show_col_types = FALSE)
+cat("Dimensions:", nrow(test_mirna), "rows x", ncol(test_mirna), "columns\n\n")
+cat("Column names:\n")
+print(colnames(test_mirna))
+head(test_mirna, 10)
+```
+
+## 7. Read All RNA-Seq Count Files
+
+```{r read-rnaseq-function}
+read_rnaseq <- function(filepath) {
+  df <- read_tsv(filepath, comment = "#", show_col_types = FALSE)
+  
+  # Remove the first 4 summary rows
+  df <- df[-(1:4), ]
+  
+  # Extract the UUID folder name (this matches "File ID" in the sample sheet)
+  uuid <- basename(dirname(filepath))
+  
+  # Keep gene annotation + unstranded counts
+  df <- df %>%
+    select(gene_id, gene_name, gene_type, unstranded) %>%
+    rename(!!uuid := unstranded)
+  
+  return(df)
+}
+```
+
+```{r read-all-rnaseq, cache=TRUE}
+message("Reading ", length(rna_files), " RNA-Seq files")
+
+# Read the first file to get gene annotations
+rna_first <- read_rnaseq(rna_files[1])
+gene_info <- rna_first %>% select(gene_id, gene_name, gene_type)
+
+# Read all files, keeping only gene_id + counts
+rna_counts_list <- lapply(rna_files, function(f) {
+  df <- read_rnaseq(f)
+  df %>% select(-gene_name, -gene_type)  # just gene_id + count column
+})
+
+# Merge all into one data frame by gene_id
+rna_merged <- rna_counts_list %>%
+  reduce(full_join, by = "gene_id")
+
+# Re-attach gene annotations
+rna_merged <- left_join(gene_info, rna_merged, by = "gene_id")
+
+cat("RNA-Seq merged matrix:", nrow(rna_merged), "genes x",
+    ncol(rna_merged) - 3, "samples\n")
+```
+
+## 8. Read All miRNA-Seq Count Files
+
+```{r read-mirna-function}
+read_mirna <- function(filepath) {
+  df <- read_tsv(filepath, show_col_types = FALSE)
+  uuid <- basename(dirname(filepath))
+  df <- df %>%
+    select(miRNA_ID, read_count) %>%
+    rename(!!uuid := read_count)
+  return(df)
+}
+```
+
+```{r read-all-mirna, cache=TRUE}
+message("Reading ", length(mirna_files), " miRNA-Seq files...")
+
+mirna_counts_list <- lapply(mirna_files, read_mirna)
+
+mirna_merged <- mirna_counts_list %>%
+  reduce(full_join, by = "miRNA_ID")
+
+cat("miRNA-Seq merged matrix:", nrow(mirna_merged), "miRNAs x",
+    ncol(mirna_merged) - 1, "samples\n")
+```
+
+## 9. Build UUID-to-Barcode Mapping from Sample Sheet
+
+```{r uuid-mapping}
+# Get the UUIDs from our count matrices
+rna_uuids   <- colnames(rna_merged)[-(1:3)]   # exclude gene_id, gene_name, gene_type
+mirna_uuids <- colnames(mirna_merged)[-1]      # exclude miRNA_ID
+
+# Split the sample sheet by data type
+rna_sample_info <- sample_sheet %>%
+  filter(`File ID` %in% rna_uuids)
+
+mirna_sample_info <- sample_sheet %>%
+  filter(`File ID` %in% mirna_uuids)
+
+cat("RNA-Seq files matched to sample sheet:", nrow(rna_sample_info), "/", length(rna_uuids), "\n")
+cat("miRNA-Seq files matched to sample sheet:", nrow(mirna_sample_info), "/", length(mirna_uuids), "\n")
+
+cat("\n--- RNA-Seq Tissue Types ---\n")
+print(table(rna_sample_info$`Tissue Type`))
+
+cat("\n--- miRNA-Seq Tissue Types ---\n")
+print(table(mirna_sample_info$`Tissue Type`))
+```
+
+## 10. Match Patients with Both RNA-Seq and miRNA-Seq
+
+For the sensitivity correlation analysis, each patient needs **both** RNA-Seq and miRNA-Seq data from the same tissue type. We match using `Case ID` + `Tissue Type`
+
+```{r match-patients}
+# Create match keys from Case ID + Tissue Type
+rna_sample_info <- rna_sample_info %>%
+  mutate(match_key = paste(`Case ID`, `Tissue Type`, sep = "_"))
+
+mirna_sample_info <- mirna_sample_info %>%
+  mutate(match_key = paste(`Case ID`, `Tissue Type`, sep = "_"))
+
+# Find patients with both data types
+matched <- inner_join(
+  rna_sample_info %>% select(`File ID`, `Case ID`, `Tissue Type`, match_key),
+  mirna_sample_info %>% select(`File ID`, `Case ID`, `Tissue Type`, match_key),
+  by = "match_key",
+  suffix = c("_rna", "_mirna")
+)
+
+cat("Total matched patient-samples:", nrow(matched), "\n")
+
+# Check for duplicates (multiple aliquots per patient)
+dup_check <- matched %>% count(match_key, sort = TRUE)
+cat("Patients with >1 match:", sum(dup_check$n > 1), "\n")
+
+# If duplicates exist, keep only one per patient
+if (any(dup_check$n > 1)) {
+  matched <- matched %>%
+    distinct(match_key, .keep_all = TRUE)
+  cat("After deduplication:", nrow(matched), "matched samples\n")
+}
+
+# Tissue type is already right there — just use it
+matched <- matched %>%
+  mutate(tissue = `Tissue Type_rna`)
+
+cat("\n--- Matched samples by tissue type ---\n")
+print(table(matched$tissue))
+```
+
+## 11. Separate mRNAs and lncRNAs by Gene Biotype
+
+Using the GENCODE `gene_type` annotations from the STAR output, we split genes into protein-coding (mRNA) and lncRNA categories.
+
+```{r separate-biotypes}
+cat("Top 15 gene biotypes in the data:\n")
+gene_info %>% count(gene_type, sort = TRUE) %>% head(15) %>% print()
+
+mrna_genes   <- gene_info %>% filter(gene_type == "protein_coding")
+lncrna_genes <- gene_info %>% filter(gene_type == "lncRNA")
+
+cat("\nProtein-coding (mRNA) genes:", nrow(mrna_genes), "\n")
+cat("lncRNA genes:", nrow(lncrna_genes), "\n")
+```
+
+## 12 + 13. Build Clean Numeric Count Matrices, Rename, and Align
+
+We subset to matched samples only, split by RNA biotype, convert to numeric, rename UUIDs to match keys, and ensure all three matrices are aligned by patient .
+
+```{r build-rename-align}
+# Get matched File IDs
+matched_rna_uuids   <- matched$`File ID_rna`
+matched_mirna_uuids <- matched$`File ID_mirna`
+
+# Barcode mapping vectors (UUID -> match_key)
+rna_uuid_to_key   <- setNames(matched$match_key, matched$`File ID_rna`)
+mirna_uuid_to_key <- setNames(matched$match_key, matched$`File ID_mirna`)
+
+# --- RNA-Seq: subset to matched samples only ---
+rna_sub <- rna_merged %>%
+  select(gene_id, gene_name, gene_type, all_of(matched_rna_uuids))
+
+# mRNA matrix
+mrna_count_matrix <- rna_sub %>%
+  filter(gene_type == "protein_coding") %>%
+  select(-gene_name, -gene_type) %>%
+  column_to_rownames("gene_id")
+mrna_count_matrix[] <- lapply(mrna_count_matrix, as.numeric)
+
+# lncRNA matrix
+lncrna_count_matrix <- rna_sub %>%
+  filter(gene_type == "lncRNA") %>%
+  select(-gene_name, -gene_type) %>%
+  column_to_rownames("gene_id")
+lncrna_count_matrix[] <- lapply(lncrna_count_matrix, as.numeric)
+
+# miRNA matrix
+mirna_count_matrix <- mirna_merged %>%
+  select(miRNA_ID, all_of(matched_mirna_uuids)) %>%
+  column_to_rownames("miRNA_ID")
+mirna_count_matrix[] <- lapply(mirna_count_matrix, as.numeric)
+
+# Verify mrna and lncrna have identical columns BEFORE renaming
+cat("mrna cols == lncrna cols (before rename)?",
+    identical(colnames(mrna_count_matrix), colnames(lncrna_count_matrix)), "\n")
+
+# Rename UUID columns to match keys
+colnames(mrna_count_matrix)   <- rna_uuid_to_key[colnames(mrna_count_matrix)]
+colnames(lncrna_count_matrix) <- rna_uuid_to_key[colnames(lncrna_count_matrix)]
+colnames(mirna_count_matrix)  <- mirna_uuid_to_key[colnames(mirna_count_matrix)]
+
+# Reorder all three to the same match key order
+shared_keys <- intersect(colnames(mrna_count_matrix), colnames(mirna_count_matrix))
+cat("Shared sample keys across RNA and miRNA:", length(shared_keys), "\n")
+
+mrna_count_matrix   <- mrna_count_matrix[, shared_keys]
+lncrna_count_matrix <- lncrna_count_matrix[, shared_keys]
+mirna_count_matrix  <- mirna_count_matrix[, shared_keys]
+
+# Final verification
+stopifnot(identical(colnames(mrna_count_matrix), colnames(lncrna_count_matrix)))
+stopifnot(identical(colnames(mrna_count_matrix), colnames(mirna_count_matrix)))
+
+cat("All three matrices aligned. Samples:", ncol(mrna_count_matrix), "\n")
+cat("First 5 sample keys:", head(colnames(mrna_count_matrix), 5), "\n")
+
+cat("\nmRNA count matrix:", nrow(mrna_count_matrix), "genes x", ncol(mrna_count_matrix), "samples\n")
+cat("lncRNA count matrix:", nrow(lncrna_count_matrix), "genes x", ncol(lncrna_count_matrix), "samples\n")
+cat("miRNA count matrix:", nrow(mirna_count_matrix), "miRNAs x", ncol(mirna_count_matrix), "samples\n")
+```
+
+## 14. Create Tissue Label Vector
+
+```{r tissue-labels}
+tissue_labels <- setNames(matched$tissue, matched$match_key)
+tissue_vec <- tissue_labels[colnames(mrna_count_matrix)]
+
+cat("Tumor samples:", sum(tissue_vec == "Tumor"), "\n")
+cat("Normal samples:", sum(tissue_vec == "Normal"), "\n")
+```
+
+## 15. Filter Low-Expression Genes
+
+Retain genes expressed (≥ minimum count) in at least 10% of samples
+
+```{r filter-low-expression}
+filter_low_expr <- function(count_df, min_count = 10, min_fraction = 0.10) {
+  keep <- rowSums(count_df >= min_count) >= (ncol(count_df) * min_fraction)
+  count_df[keep, , drop = FALSE]
+}
+
+mrna_filtered   <- filter_low_expr(mrna_count_matrix, min_count = 10)
+lncrna_filtered <- filter_low_expr(lncrna_count_matrix, min_count = 10)
+mirna_filtered  <- filter_low_expr(mirna_count_matrix, min_count = 5)
+
+cat("After filtering (expressed in ≥10% of samples):\n")
+cat("  mRNAs:", nrow(mrna_filtered), " (from", nrow(mrna_count_matrix), ")\n")
+cat("  lncRNAs:", nrow(lncrna_filtered), " (from", nrow(lncrna_count_matrix), ")\n")
+cat("  miRNAs:", nrow(mirna_filtered), " (from", nrow(mirna_count_matrix), ")\n")
+```
+
+## 16. Preview the Final Data Frames
+
+```{r preview}
+
+mrna_filtered[1:5, 1:5]
+
+
+lncrna_filtered[1:5, 1:5]
+
+
+mirna_filtered[1:5, 1:5]
+
+head(matched, 10)
+```
+
+## 17. Save
+
+```{r save}
+save(
+  mrna_filtered, lncrna_filtered, mirna_filtered,
+  mrna_count_matrix, lncrna_count_matrix, mirna_count_matrix,
+  gene_info, mrna_genes, lncrna_genes,
+  matched, tissue_vec,
+  sample_sheet,
+  file = file.path(results_dir, "processed_data.RData")
+)
+
+cat("Saved to:", file.path(results_dir, "processed_data.RData"), "\n")
+```
+
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```
